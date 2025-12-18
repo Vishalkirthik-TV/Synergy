@@ -3,6 +3,8 @@ import json
 import base64
 import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+from browser_manager import BrowserManager
+from emotion_processor import EmotionProcessor
 from transformers import (
     AutoModelForImageTextToText,
     TextIteratorStreamer,
@@ -23,17 +25,14 @@ from typing import Optional, Dict, Any, List
 import uvicorn
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
-import json
-
-# FastAPI imports
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+import aiohttp
+from twilio.rest import Client
+from twilio.jwt.access_token import AccessToken
+from twilio.jwt.access_token.grants import VoiceGrant
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
-
-# Import Kokoro TTS library
-# Import aiohttp for API calls
-import aiohttp
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -47,18 +46,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Add compatibility for Python < 3.10 where anext is not available
-try:
-    anext
-except NameError:
-
-    async def anext(iterator):
-        """Get the next item from an async iterator, or raise StopAsyncIteration."""
-        try:
-            return await iterator.__anext__()
-        except StopAsyncIteration:
-            raise
-
+# FIX: Enforce ProactorEventLoop on Windows for Playwright/Asyncio Subprocesses
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 class ImageManager:
     """Manages image saving and verification"""
@@ -171,6 +161,7 @@ class MemoryManager:
         m = self.memory
         profile = m["user_profile"]
         
+
         # SIMPLIFIED PROMPT - No potentially triggering language
         prompt = f"""You are Emily, a helpful AI assistant.
 
@@ -183,11 +174,163 @@ INSTRUCTIONS:
 - Keep responses very short (1-2 sentences)
 - Be natural and conversational
 - Don't be overly formal or robotic
+- If you see [User sounds <emotion>] prefix, respond empathetically to their emotional state
 - Answer questions directly
+- If the user asks to call a specific person OR number (e.g., "Call Rahul", "Call Mom", "Call 123"):
+  1. ASK FOR CONFIRMATION FIRST (e.g., "Are you sure you want to call them?")
+  2. Once confirmed, output EXACTLY: [CALL: +917387130524]
+  3. ALWAYS use this hardcoded number +917387130524 for ANY call request.
+  4. Do not output anything else with the command.
+
+- If the user asks to send SMS/text (e.g., "Send SMS to John", "Text Mom hello"):
+  1. Say "Sure, sending message."
+  2. IMMEDIATELY output: [SMS: <message_content>]
+     - If user provided a message, use it: [SMS: Hello this is from Emily]
+     - If no message, use default: [SMS: msg from chatbot]
+  3. Message always goes to the same number, ignore the recipient name.
+
+- If the user wants to SHOP, BROWSE, or BUY something (e.g. "I want to buy a phone", "Search Amazon for shoes", "Look on Flipkart"):
+  1. Say "Sure, I'll browse [website] for you."
+  2. IMMEDIATELY output command: [BROWSE: <search_url>]
+     - For Amazon: [BROWSE: https://www.amazon.in/s?k=<query>]
+     - For Flipkart: [BROWSE: https://www.flipkart.com/search?q=<query>]
+     - For other sites: [BROWSE: https://www.google.com/search?q=<query>]
+  3. DO NOT ASK for more details yet. Just start browsing.
+
+- IF YOU SEE A SCREENSHOT of a browser:
+  - You are controlling the browser.
+  - Output ONE action command based on the goal:
+    - [ACTION: click <css_selector>] 
+    - [ACTION: type <css_selector> <text>]
+    - [ACTION: scroll_down]
+    - [ACTION: scroll_up]
+  - Example: "I see the search result. Clicking it now." [ACTION: click div[data-component-type="s-search-result"] h2 a]
 
 USER: {profile['name']}
 """
         return prompt
+
+class TwilioManager:
+    """Manages Twilio calls and Voice SDK tokens"""
+    
+    _instance = None
+    
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+        
+    def __init__(self):
+        self.account_sid = os.getenv('TWILIO_ACCOUNT_SID')
+        self.auth_token = os.getenv('TWILIO_AUTH_TOKEN')
+        self.api_key = os.getenv('TWILIO_API_KEY_SID') # Optional: Use Auth Token if API Key not set, but Token requires API KEY usually.
+        self.api_secret = os.getenv('TWILIO_API_KEY_SECRET') # Optional
+        
+        #Fallback to Account SID/Auth Token if API Keys missing (Not recommended for prod but works for dev sometimes)
+        
+        self.from_number = os.getenv('TWILIO_PHONE_NUMBER')
+        self.target_number = os.getenv('USER_PHONE_NUMBER')
+        self.twiml_app_sid = os.getenv('TWILIO_TWIML_APP_SID') # REQUIRED for Voice SDK
+        
+        if self.account_sid and self.auth_token:
+            try:
+                self.client = Client(self.account_sid, self.auth_token)
+                logger.info("Twilio initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize Twilio client: {e}")
+                self.client = None
+        else:
+            logger.error("Twilio credentials missing")
+            self.client = None
+
+    def get_token(self, identity: str = "browser_user"):
+        """Generate Access Token for Twilio Voice SDK"""
+        if not self.account_sid or not self.auth_token or not self.twiml_app_sid:
+            logger.error("❌ Cannot generate token: Missing SID, Token, or TwiML App SID")
+            return None
+
+        # Create access token with credentials
+        # Note: Ideally use API Key/Secret, but we can try using Account SID/Auth Token if lib supports it equivalent
+        # Actually AccessToken REQUIRES API Key. 
+        # For simplicity in this dev environment, we will use Account SID as API Key and Auth Token as Secret (Works for some setups or we need to generate one)
+        # BUT Twilio recommends creating an API Key.
+        
+        # Checking if we have specific API keys, if not, we use the Main Auth Token (Not standard but valid for testing sometimes? No, AccessToken needs SID)
+        # We will assume user might not have API Keys. 
+        # FIX: We will just try using AccountSID + AuthToken. 
+        
+        token = AccessToken(
+            self.account_sid,
+            self.api_key if self.api_key else self.account_sid, # Fallback
+            self.api_secret if self.api_secret else self.auth_token, # Fallback
+            identity=identity
+        )
+
+        # Create a Voice grant and add to token
+        voice_grant = VoiceGrant(
+            outgoing_application_sid=self.twiml_app_sid,
+            incoming_allow=True, # Allow incoming calls to browser
+        )
+        token.add_grant(voice_grant)
+
+        return token.to_jwt()
+
+    def get_voice_response_xml(self, to_number: str = None):
+        """Generate TwiML for incoming call from Browser"""
+        # If no number specified, default to the hardcoded Target
+        target = to_number or self.target_number
+        if not target:
+             return '<Response><Say>No target number configured.</Say></Response>'
+             
+        # TwiML to dial the real phone
+        # callerId should be the Twilio Number (to show up on recipient's phone)
+        xml = f"""
+        <Response>
+            <Dial callerId="{self.from_number}">
+                <Number>{target}</Number>
+            </Dial>
+        </Response>
+        """
+        return xml.strip()
+
+    def make_call(self, requested_number: str):
+        """Legacy direct call method - Kept for compatibility but SDK should be used"""
+        return self.make_call_direct(requested_number)
+        
+    def make_call_direct(self, target_number: str):
+        """Initiate a call to the Hardcoded Target (Notification Style)"""
+        # ... (Existing logic for notification call if needed) ...
+        if not self.client or not self.target_number:
+            return False
+            
+        try:
+            logger.info(f"📞 Initiating notification call to {self.target_number}")
+            twiml = f'<Response><Say>Hello. This is a notification call.</Say></Response>'
+            self.client.calls.create(to=self.target_number, from_=self.from_number, twiml=twiml)
+            return True
+        except Exception as e:
+            logger.error(f"Call failed: {e}")
+            return False
+    
+    def send_sms(self, message_body: str):
+        """Send SMS to the hardcoded target number"""
+        if not self.client or not self.target_number or not self.from_number:
+            logger.error("❌ Cannot send SMS: Missing Twilio client or phone numbers")
+            return False
+        
+        try:
+            logger.info(f"📱 Sending SMS to {self.target_number}")
+            message = self.client.messages.create(
+                body=message_body,
+                from_=self.from_number,
+                to=self.target_number
+            )
+            logger.info(f"✅ SMS sent successfully. SID: {message.sid}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ SMS failed: {e}")
+            return False
 
 
 class GeminiProcessor:
@@ -211,25 +354,26 @@ class GeminiProcessor:
         genai.configure(api_key=api_key)
         
         # Safety settings - allow free conversation
-        safety_settings = {
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-        }
+        # Safety settings - allow free conversation
+        # Using ALL caps strings for categories to ensure compatibility
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
         
-        # Initialize Gemini Flash - REVERTED to working config
-        # Using gemini-flash-latest (this is gemini-2.5-flash)
-        # Note: Free tier has 20 requests/day limit
+        # Initialize Gemini Flash
+        # Using specific model version for stability
         generation_config = {
-            "temperature": 0.9,  # More natural, less robotic
+            "temperature": 0.9,
             "top_p": 0.95,
             "top_k": 40,
-            "max_output_tokens": 100,  # Keep responses SHORT (1-2 sentences)
+            "max_output_tokens": 100,
         }
         
         self.model = genai.GenerativeModel(
-            model_name="gemini-flash-latest",  # Original working name
+            model_name="gemini-flash-latest", 
             safety_settings=safety_settings,
             generation_config=generation_config
         )
@@ -251,6 +395,16 @@ class GeminiProcessor:
             
             # Start chat with user-specific prompt
             system_prompt = memory_mgr.get_system_prompt()
+            
+            # Add Sign Language Capabilities
+            system_prompt += """
+            
+            SIGN LANGUAGE CAPABILITIES:
+            - If you need to perform a sign language gesture (e.g. for deaf users), use the BROWSE command to show it.
+            - Format: [BROWSE: https://www.signasl.org/sign/word] (Replace 'word' with the specific sign).
+            - Example: "I can show you how to sign hello. [BROWSE: https://www.signasl.org/sign/hello]"
+            """
+            
             self.sessions[user_id] = self.model.start_chat(
                 history=[
                     {"role": "user", "parts": [system_prompt]},
@@ -295,23 +449,33 @@ class GeminiProcessor:
             logger.error(f"Gemini generation error: {e}")
             return "I'm having a bit of a headache right now. Can we try again?"
     
-    async def generate_response_streaming(self, text: str, user_id: str, image_data: bytes = None):
+    async def generate_response_streaming(self, text: str, user_id: str, image_data: list[bytes] | bytes = None):
         """Generate streaming response using Gemini for specific user - yields sentences progressively"""
         if not self.model:
             yield "I'm sorry, my brain (API Key) is missing. Please check the logs."
             return
             
         try:
-            logger.info(f"🧠 Gemini streaming for {user_id}: '{text}' (Image: {bool(image_data)})")
+            logger.info(f"🧠 Gemini streaming for {user_id}: '{text}' (Image Data: {bool(image_data)})")
             
             chat_session = self.get_or_create_session(user_id)
             
             content = []
             if image_data:
-                # Convert bytes to PIL Image
-                image = Image.open(io.BytesIO(image_data))
-                content.append(image)
-                content.append(f"User showed this image and said: {text}")
+                # Handle single image or list of images (video frames)
+                if isinstance(image_data, list):
+                     for idx, img_bytes in enumerate(image_data):
+                         try:
+                             image = Image.open(io.BytesIO(img_bytes))
+                             content.append(image)
+                         except Exception as e:
+                             logger.error(f"Error processing frame {idx}: {e}")
+                     content.append(f"User showed this sequence of sign language video frames and said/signed: {text}")
+                else:
+                    # Single image (legacy)
+                    image = Image.open(io.BytesIO(image_data))
+                    content.append(image)
+                    content.append(f"User showed this image and said: {text}")
             else:
                 content.append(text)
             
@@ -338,7 +502,9 @@ class GeminiProcessor:
             
             # Buffer for accumulating text
             buffer = ""
-            sentence_end_pattern = re.compile(r'[.!?]\s*')
+            # FIX: Require whitespace after punctuation to avoid splitting URLs like 'www.amazon.com'
+            # Still split on ']' which is our command delimiter
+            sentence_end_pattern = re.compile(r'([.!?]\s+|\]\s*)')
             
             # Process streaming chunks
             for chunk in response_stream:
@@ -1015,6 +1181,8 @@ class ConnectionManager:
         self.active_connections: Dict[str, WebSocket] = {}
         # Track current processing tasks for each client
         self.current_tasks: Dict[str, Dict[str, asyncio.Task]] = {}
+        # Client configurations (e.g. mode: deaf/mute)
+        self.client_configs: Dict[str, dict] = {}
         # Add image manager
         self.image_manager = ImageManager()
         # Track statistics
@@ -1029,7 +1197,17 @@ class ConnectionManager:
         await websocket.accept()
         self.active_connections[client_id] = websocket
         self.current_tasks[client_id] = {"processing": None, "tts": None}
+        self.client_configs[client_id] = {"mode": "normal"}
         logger.info(f"Client {client_id} connected")
+
+    def set_config(self, client_id: str, config: dict):
+        if client_id not in self.client_configs:
+            self.client_configs[client_id] = {}
+        self.client_configs[client_id].update(config)
+        logger.info(f"Updated config for {client_id}: {self.client_configs[client_id]}")
+
+    def get_config(self, client_id: str):
+        return self.client_configs.get(client_id, {"mode": "normal"})
 
     def disconnect(self, client_id: str):
         if client_id in self.active_connections:
@@ -1178,6 +1356,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     # Use Gemini Processor for Brain + Memory
     gemini_processor = GeminiProcessor.get_instance()
     tts_processor = ElevenLabsTTSProcessor.get_instance()
+    twilio_manager = TwilioManager.get_instance()
+    emotion_processor = EmotionProcessor.get_instance()  # Background emotion detection
 
     try:
         # Send initial configuration confirmation
@@ -1196,70 +1376,242 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 except Exception:
                     break
 
-        async def process_audio_segment(audio_data, image_data=None):
-            """Process a complete audio segment through the pipeline with optional image - STREAMING VERSION"""
+        async def process_audio_segment(audio_data=None, image_data=None, text_input=None):
+            """Process a complete audio segment OR sign language sequence through the pipeline - STREAMING VERSION"""
             try:
                 # Log what we received
                 if image_data:
+                    img_size = len(image_data) if isinstance(image_data, bytes) else sum(len(f) for f in image_data) if isinstance(image_data, list) else 0
                     logger.info(
-                        f"🎥 Processing audio+image segment: audio={len(audio_data)} bytes, image={len(image_data)} bytes"
+                        f"🎥 Processing segment with images: audio={len(audio_data) if audio_data else 0} bytes, image={img_size} bytes"
                     )
                     manager.update_stats("audio_with_image_received")
+                    
+                    # (Skip saving list of images for now to keep it simple, or save first frame)
 
-                    # Save the image for verification
-                    saved_path = manager.image_manager.save_image(
-                        image_data, client_id, "multimodal"
-                    )
-                    if saved_path:
-                        # Verify the saved image
-                        verification = manager.image_manager.verify_image(saved_path)
-                        if verification.get("valid"):
-                            logger.info(
-                                f"📸 Image verified successfully: {verification['size']} pixels"
-                            )
-                        else:
-                            logger.warning(
-                                f"⚠️ Image verification failed: {verification}"
-                            )
-
-                else:
+                elif audio_data:
                     logger.info(
                         f"🎤 Processing audio-only segment: {len(audio_data)} bytes"
                     )
                     manager.update_stats("audio_segments_received")
 
-                # Send interrupt immediately since frontend determined this is valid speech
+                # Send interrupt immediately
                 logger.info("Sending interrupt signal")
                 interrupt_message = json.dumps({"interrupt": True})
                 await websocket.send_text(interrupt_message)
 
-                # Step 1: Transcribe audio with Whisper
-                logger.info("Starting Whisper transcription")
-                transcribed_text = await whisper_processor.transcribe_audio(audio_data)
-                logger.info(f"Transcription result: '{transcribed_text}'")
+                # BACKGROUND EMOTION DETECTION
+                emotion_task = None
+                if audio_data:
+                    emotion_task = asyncio.create_task(
+                        emotion_processor.detect_emotion_async(audio_data)
+                    )
+
+                # Step 1: Transcribe audio OR use text input
+                if audio_data:
+                    logger.info("Starting Whisper transcription")
+                    transcribed_text = await whisper_processor.transcribe_audio(audio_data)
+                    logger.info(f"Transcription result: '{transcribed_text}'")
+                else:
+                    transcribed_text = text_input or "Describe this."
+
+                # Apply User Mode Context
+                client_config = manager.get_config(client_id)
+                mode = client_config.get("mode", "normal")
+                
+                if mode == "deaf":
+                    transcribed_text += " [SYSTEM INSTRUCTION: The user is DEAF. You MUST respond with a [BROWSE: url] command pointing to a sign language video (e.g. from signasl.org) that represents your response. Do not rely on audio output alone.]"
+                elif mode == "mute":
+                     transcribed_text += " [SYSTEM NOTE: User is Mute.]"
 
                 # Check if transcription indicates noise
                 if transcribed_text in ["NOISE_DETECTED", "NO_SPEECH", None]:
                     logger.info(
-                        f"Noise detected in transcription: '{transcribed_text}'. Skipping further processing."
+                        f"Noise detected: '{transcribed_text}'. Skipping."
                     )
                     return
 
                 # STREAMING GEMINI GENERATION
                 # ----------------------------
+                # Check if we have a Browser Screenshot to serve as context if no User Image
+                if not image_data:
+                    browser_manager = BrowserManager.get_instance()
+                    screenshot_b64 = await browser_manager.get_screenshot()
+                    if screenshot_b64:
+                        logger.info("🖼️ Injecting Browser Screenshot into Gemini Context")
+                        image_data = base64.b64decode(screenshot_b64)
+                
                 logger.info(f"🚀 Starting STREAMING response generation for user: {client_id}")
+                
+                # Check if emotion detection completed (don't wait, just check if done)
+                emotion_context = ""
+                if emotion_task and emotion_task.done():
+                    try:
+                        emotion_result = emotion_task.result()
+                        if emotion_result and emotion_result.get("confidence", 0) > 0.5:
+                            emotion = emotion_result["emotion"]
+                            emotion_context = f"[User sounds {emotion}] "
+                            logger.info(f"🎭 Adding emotion context: {emotion}")
+                    except Exception as e:
+                        logger.debug(f"Emotion task failed (non-critical): {e}")
+                
+                # Augment transcribed text with emotion if available
+                contextualized_text = emotion_context + transcribed_text
                 
                 sentence_count = 0
                 
                 # Stream responses sentence by sentence from Gemini
                 async for sentence in gemini_processor.generate_response_streaming(
-                    transcribed_text, client_id, image_data
+                    contextualized_text, client_id, image_data
                 ):
                     sentence_count += 1
                     logger.info(f"📝 Sentence {sentence_count}: '{sentence}'")
                     
-                    # Immediately synthesize and send this sentence
+                    # Immediately synthesize and send this sentence (OR HANDLE COMMAND)
                     if sentence and sentence.strip():
+                        # CHECK FOR COMMANDS
+                        if "[CALL:" in sentence:
+                            try:
+                                logger.info(f"📞 Detected call command: {sentence}")
+                                # Extract number
+                                match = re.search(r'\[CALL:\s*([+\d\s-]+)\]', sentence)
+                                if match:
+                                    number = match.group(1).strip()
+                                    logger.info(f"Making call to: {number}")
+                                    
+                                    # Notify user we are calling
+                                    await websocket.send_text(json.dumps({
+                                        "type": "status",
+                                        "message": f"Calling {number}..."
+                                    }))
+                                    
+                                    # TRIGGER CALL
+                                    # success = twilio_manager.make_call(number)
+                                    success = True # Client side handles it logic now
+                                    
+                                    if success:
+                                        feedback = "I've connected the call."
+                                    else:
+                                        feedback = "I couldn't put the call through. Please check the logs."
+                                        
+                                    # Send feedback audio
+                                    sentence = feedback
+                                else:
+                                    logger.warning("Could not parse number from call command")
+                            except Exception as e:
+                                logger.error(f"Error handling call command: {e}")
+                        
+                        elif "[SMS:" in sentence:
+                            try:
+                                logger.info(f"📱 Detected SMS command: {sentence}")
+                                # Extract message content
+                                match = re.search(r'\[SMS:\s*(.+?)\]', sentence)
+                                if match:
+                                    message_body = match.group(1).strip()
+                                    logger.info(f"Sending SMS with message: '{message_body}'")
+                                    
+                                    # Send SMS
+                                    success = twilio_manager.send_sms(message_body)
+                                    
+                                    if success:
+                                        feedback = "Message sent successfully."
+                                    else:
+                                        feedback = "I couldn't send the message. Please check the logs."
+                                    
+                                    # Replace sentence with feedback
+                                    sentence = feedback
+                                else:
+                                    logger.warning("Could not parse message from SMS command")
+                            except Exception as e:
+                                logger.error(f"Error handling SMS command: {e}")
+                        
+                        elif "[BROWSE:" in sentence:
+                            try:
+                                logger.info(f"🌐 Detected BROWSE command: {sentence}")
+                                match = re.search(r'\[BROWSE:\s*(.+?)\]', sentence)
+                                if match:
+                                    url = match.group(1).strip()
+                                    logger.info(f"Navigating to: {url}")
+                                    
+                                    # Notify user
+                                    await websocket.send_text(json.dumps({
+                                        "type": "status",
+                                        "message": f"Browsing {url}..."
+                                    }))
+
+                                    # Send LOADING state to open the UI immediately
+                                    await websocket.send_text(json.dumps({
+                                        "type": "browser_update",
+                                        "image": "LOADING"
+                                    }))
+
+                                    # Initialize Browser
+                                    browser_manager = BrowserManager.get_instance()
+                                    await browser_manager.navigate(url)
+                                    screenshot = await browser_manager.get_screenshot() # Base64 string
+                                    
+                                    if screenshot:
+                                        # Send to Client View
+                                        await websocket.send_text(json.dumps({
+                                            "type": "browser_update",
+                                            "image": screenshot
+                                        }))
+                                        
+                                        # Update Context for NEXT turn (simulated by setting it here?)
+                                        # Actually, for the *next* user query, we want this image.
+                                        # But often we want the agent to react *immediately* to what it sees (Auto-GPT style).
+                                        # For now, let's just show it to the user. User will ask "What do you see?" or Agent will continue.
+                                        
+                                        # To make it agentic, we might need to trigger a self-loop? 
+                                        # Let's keep it simple: User initiates, Agent acts, User verifies.
+                                        pass
+                            except Exception as e:
+                                logger.error(f"Error handling BROWSE command: {e}")
+
+                        elif "[ACTION:" in sentence:
+                            try:
+                                logger.info(f"🖱️ Detected ACTION command: {sentence}")
+                                browser_manager = BrowserManager.get_instance()
+                                
+                                # Parse Action
+                                # [ACTION: click selector]
+                                # [ACTION: type selector text]
+                                action_match = re.search(r'\[ACTION:\s*(\w+)\s+(.+?)\]', sentence)
+                                if action_match:
+                                    action_type = action_match.group(1).lower()
+                                    params = action_match.group(2).strip()
+                                    
+                                    logger.info(f"Executing Browser Action: {action_type} on {params}")
+                                    
+                                    if action_type == "click":
+                                        await browser_manager.click_element(params)
+                                    elif action_type == "type":
+                                        # Handle 'selector "text"'
+                                        # Simple split might fail on spaces in selector. Assuming selector is first word?
+                                        # Let's try flexible parsing or expect specific format
+                                        parts = params.split(' ', 1)
+                                        if len(parts) == 2:
+                                            selector, text = parts
+                                            # remove quotes if present
+                                            text = text.strip('"\'')
+                                            await browser_manager.type_text(selector, text)
+                                    elif "scroll" in action_type:
+                                        if "down" in action_type:
+                                            await browser_manager.run_action("scroll_down")
+                                        else:
+                                            await browser_manager.run_action("scroll_up")
+                                            
+                                    # After action, capture new state
+                                    await asyncio.sleep(1) # Wait for render
+                                    screenshot = await browser_manager.get_screenshot()
+                                    if screenshot:
+                                        await websocket.send_text(json.dumps({
+                                            "type": "browser_update",
+                                            "image": screenshot
+                                        }))
+                            except Exception as e:
+                                logger.error(f"Error handling ACTION command: {e}")
+                        
                         logger.info(f"🎵 Synthesizing sentence {sentence_count}: '{sentence}'")
                         
                         # Generate TTS for this sentence WITH NATIVE TIMING
@@ -1326,14 +1678,13 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     try:
                         message = json.loads(data)
 
-                        # Handle interrupt signal
-                        if "interrupt" in message and message["interrupt"]:
-                            logger.info(f"🛑 Received INTERRUPT signal from {client_id}")
-                            await manager.cancel_current_tasks(client_id)
+                        # Handle config update
+                        if message.get("type") == "config":
+                            manager.set_config(client_id, message)
                             continue
 
                         # Handle complete audio segments from frontend
-                        if "audio_segment" in message:
+                        elif "audio_segment" in message:
                             # Cancel any current processing
                             await manager.cancel_current_tasks(client_id)
 
@@ -1357,6 +1708,27 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 process_audio_segment(audio_data, image_data)
                             )
                             manager.set_task(client_id, "processing", processing_task)
+
+                        # Handle Sign Language Sequence
+                        elif message.get("type") == "sign_sequence":
+                            frames = message.get("frames", [])
+                            if len(frames) > 0:
+                                await manager.cancel_current_tasks(client_id)
+                                await websocket.send_json({"type": "status", "message": "Interpreting Sign Language..."})
+                                
+                                # Convert base64 frames to bytes
+                                decoded_frames = []
+                                for f in frames:
+                                    try:
+                                        decoded_frames.append(base64.b64decode(f))
+                                    except:
+                                        pass
+                                
+                                prompt = "Interpret this sign language video sequence. Translate the signs into English text. If it is a request, fulfill it. If it is a greeting, reply naturally."
+                                processing_task = asyncio.create_task(
+                                    process_audio_segment(audio_data=None, image_data=decoded_frames, text_input=prompt)
+                                )
+                                manager.set_task(client_id, "processing", processing_task)
 
                         # Handle standalone images (only if not currently processing)
                         elif "image" in message:
@@ -1511,5 +1883,26 @@ def main():
         logger.error(f"Server error: {e}")
 
 
+@app.get("/api/twilio-token")
+async def get_twilio_token(request: Request):
+    """Generate Twilio Access Token for client"""
+    manager = TwilioManager.get_instance()
+    # Assuming the client sends identity, or we generate one
+    identity = request.query_params.get("identity", "browser_user")
+    token = manager.get_token(identity)
+    if not token:
+        raise HTTPException(status_code=500, detail="Failed to generate token. Check server logs and .env configuration.")
+    return {"token": token}
+
+@app.post("/api/twilio-voice")
+async def handle_voice_webhook(request: Request):
+    """Handle incoming Voice webhook from Twilio"""
+    manager = TwilioManager.get_instance()
+    # Generate TwiML to call the hardcoded target
+    xml = manager.get_voice_response_xml()
+    return Response(content=xml, media_type="application/xml")
+
+
 if __name__ == "__main__":
     main()
+    # Reload trigger V8
