@@ -27,7 +27,6 @@ export default function RootLayout({
   return (
     <html lang="en">
       <head>
-        {/* Import map for TalkingHead ES modules */}
         <script
           type="importmap"
           dangerouslySetInnerHTML={{
@@ -49,8 +48,6 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
         <WebSocketProvider>{children}</WebSocketProvider>
-
-        {/* Load TalkingHead library */}
         <Script
           id="load-talkinghead"
           strategy="lazyOnload"
