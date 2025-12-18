@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": ".venv\\Scripts\\python.exe -m uvicorn main:app --reload --reload-exclude '.venv/*'",
-    "dev:init": ".venv\\Scripts\\python.exe -m uvicorn main:app",
-    "start": ".venv\\Scripts\\python.exe -m uvicorn main:app",
-    "format": ".venv\\Scripts\\python.exe -m black .",
-    "format:check": ".venv\\Scripts\\python.exe -m black --check ."
+    "dev": "uv run uvicorn main:app --reload --reload-exclude '.venv/*'",
+    "dev:init": "uv run uvicorn main:app",
+    "start": "uv run uvicorn main:app",
+    "format": "uv run black .",
+    "format:check": "uv run black --check ."
   }
 }
