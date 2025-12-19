@@ -38,6 +38,7 @@ interface VADConfig {
 
 interface VoiceActivityDetectorProps {
   cameraStream?: MediaStream | null;
+  autoStart?: boolean;
 }
 
 // Enhanced Voice Blob Component with transmission feedback
@@ -288,7 +289,8 @@ const TransmissionHistory: React.FC<{
 };
 
 const VoiceActivityDetector: React.FC<VoiceActivityDetectorProps> = ({
-  cameraStream
+  cameraStream,
+  autoStart = false
 }) => {
   const [isListening, setIsListening] = useState(false);
   const [currentEnergy, setCurrentEnergy] = useState(0);
@@ -307,7 +309,7 @@ const VoiceActivityDetector: React.FC<VoiceActivityDetectorProps> = ({
   >([]);
 
   const [config, setConfig] = useState<VADConfig>({
-    energyThreshold: 0.05,
+    energyThreshold: 0.02,
     conversationBreakDuration: 2.5,
     minSpeechDuration: 0.8,
     maxSpeechDuration: 15,
@@ -332,8 +334,7 @@ const VoiceActivityDetector: React.FC<VoiceActivityDetectorProps> = ({
     connect,
     sendAudioSegment,
     sendImage,
-    sendAudioWithImage,
-    triggerInterrupt
+    sendAudioWithImage
   } = useWebSocketContext();
 
   // Auto-connect removed - handled by Login page
@@ -552,9 +553,6 @@ const VoiceActivityDetector: React.FC<VoiceActivityDetectorProps> = ({
       if (energy > energyThreshold) {
         if (!isInSpeechRef.current) {
           console.log('🎤 Speech started');
-          // Trigger interruption immediately when speech starts
-          triggerInterrupt();
-
           isInSpeechRef.current = true;
           speechStartTimeRef.current = Date.now();
           setIsSpeechActive(true);
@@ -643,6 +641,13 @@ const VoiceActivityDetector: React.FC<VoiceActivityDetectorProps> = ({
       alert('Failed to access microphone');
     }
   }, [config.sampleRate, initializeAudioWorklet, processAudioData]);
+
+  // Handle Auto-Start
+  useEffect(() => {
+    if (autoStart && isConnected && !isListening) {
+      startListening();
+    }
+  }, [autoStart, isConnected, isListening, startListening]);
 
   // Stop listening
   const stopListening = useCallback(() => {

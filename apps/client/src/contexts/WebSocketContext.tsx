@@ -26,6 +26,10 @@ interface WebSocketMessage {
   audio_complete?: boolean;
   error?: string;
   type?: string;
+  message?: string;
+  image?: string;
+  gesture?: string;
+  text?: string;
 }
 
 interface WebSocketContextType {
@@ -36,6 +40,8 @@ interface WebSocketContextType {
   sendAudioSegment: (audioData: ArrayBuffer) => void;
   sendImage: (imageData: string) => void;
   sendAudioWithImage: (audioData: ArrayBuffer, imageData: string) => void;
+  sendSignSequence: (frames: string[]) => void;
+  sendConfig: (config: any) => void;
   onAudioReceived: (
     callback: (
       audioData: string,
@@ -49,7 +55,10 @@ interface WebSocketContextType {
   onStatusChange: (
     callback: (status: 'connected' | 'disconnected' | 'connecting') => void
   ) => void;
-  triggerInterrupt: () => void;
+  onAnimationReceived: (callback: (gesture: string) => void) => void;
+  onCaptionReceived: (callback: (text: string) => void) => void;
+  browserImage: string | null;
+  lastMessage: WebSocketMessage | null;
 }
 
 const WebSocketContext = createContext<WebSocketContextType | null>(null);
@@ -76,9 +85,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
   const wsRef = useRef<WebSocket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
-
-  // Sequence State
-  const currentSeqRef = useRef<number>(0);
+  const [browserImage, setBrowserImage] = useState<string | null>(null);
+  const [lastMessage, setLastMessage] = useState<WebSocketMessage | null>(null);
 
   // Callback refs
   const audioReceivedCallbackRef = useRef<
@@ -95,6 +103,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
   const statusChangeCallbackRef = useRef<
     ((status: 'connected' | 'disconnected' | 'connecting') => void) | null
   >(null);
+  const animationReceivedCallbackRef = useRef<((gesture: string) => void) | null>(null);
+  const captionReceivedCallbackRef = useRef<((text: string) => void) | null>(null);
 
   const connect = useCallback(async (userId: string = 'test-client') => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -103,8 +113,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
       setIsConnecting(true);
       statusChangeCallbackRef.current?.('connecting');
 
-      // Append userId to the base URL
-      wsRef.current = new WebSocket(`${serverUrl}${userId}`);
+      // Append userId to the base URL (ensure no trailing slash on userId)
+      const cleanUserId = userId?.replace(/\/$/, '') || 'user';
+      wsRef.current = new WebSocket(`${serverUrl}${cleanUserId}`);
 
       wsRef.current.onopen = () => {
         setIsConnected(true);
@@ -116,36 +127,15 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
       wsRef.current.onmessage = (event) => {
         try {
           const data: WebSocketMessage = JSON.parse(event.data);
-
-          // --- SEQUENCING LOGIC START ---
-          if (data.seq !== undefined && data.seq !== null) {
-            const incomingSeq = data.seq;
-            // If incoming sequence is OLDER than current, ignore it
-            if (incomingSeq < currentSeqRef.current) {
-              console.log(`🗑️ Ignored stale message (seq=${incomingSeq} < current=${currentSeqRef.current})`, data.type || 'audio');
-              return;
-            }
-            // If NEWER sequence, update our current pointer
-            if (incomingSeq > currentSeqRef.current) {
-              console.log(`⏩ New sequence detected (seq=${incomingSeq}), updating from ${currentSeqRef.current}`);
-              currentSeqRef.current = incomingSeq;
-            }
-          } else if (currentSeqRef.current > 0 && (data.type === 'interrupt' || (data as any).interrupt)) {
-            // STRICT MODE: If we are tracking sequences, IGNORE interrupts without sequence ID
-            // This prevents "Ghost Interrupts" from killing valid new audio
-            console.warn('🛡️ Ignored ghost interrupt (no seq) because sequence tracking is active.');
-            return;
-          }
-          // --- SEQUENCING LOGIC END ---
-
-          console.log('WebSocket message received:', { type: data.type || (data.audio ? 'audio' : 'unknown'), seq: data.seq });
+          console.log('WebSocket message received:', data);
+          setLastMessage(data); // Set the last received message
 
           if (data.status === 'connected') {
             console.log(
               `Server confirmed connection. Client ID: ${data.client_id}`
             );
-          } else if (data.type === 'interrupt' || (data as any).interrupt) {
-            console.log(`🛑 Received confirmed interrupt (seq=${data.seq})`);
+          } else if (data.interrupt) {
+            console.log('Received interrupt signal');
             interruptCallbackRef.current?.();
           } else if (data.audio) {
             // Handle audio with native timing
@@ -160,7 +150,15 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
                   (wt) => wt.end_time - wt.start_time
                 )
               };
+              console.log('Converted timing data:', timingData);
             }
+
+            console.log('Calling audioReceivedCallback with:', {
+              audioLength: data.audio.length,
+              timingData,
+              sampleRate: data.sample_rate || 24000,
+              method: data.method || 'unknown'
+            });
 
             audioReceivedCallbackRef.current?.(
               data.audio,
@@ -168,12 +166,36 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
               data.sample_rate || 24000,
               data.method || 'unknown'
             );
+          } else if (data.audio_complete) {
+            console.log('Audio processing complete');
+          } else if (data.type === 'status') {
+            console.log('Status update:', data.message);
+            // Trigger Twilio Call if message indicates calling
+            // "Calling +123..."
+            if (data.message && data.message.startsWith("Calling")) {
+              const match = data.message.match(/Calling\s+([+\d\s-]+)/);
+              if (match) {
+                const number = match[1];
+                console.log("📞 Triggering Browser Call to:", number);
+                import('../utils/TwilioVoiceManager').then(({ default: TwilioVoiceManager }) => {
+                  TwilioVoiceManager.getInstance().makeCall(number);
+                });
+              }
+            }
+          } else if (data.type === 'browser_update') {
+            console.log('🌐 Browser Update Received');
+            setBrowserImage(data.image || null);
+          } else if (data.type === 'animate' && data.gesture) {
+            console.log('💃 Received animate command:', data.gesture);
+            animationReceivedCallbackRef.current?.(data.gesture);
+          } else if (data.type === 'caption' && data.text) {
+            console.log('📝 Received caption:', data.text);
+            captionReceivedCallbackRef.current?.(data.text);
           } else if (data.type === 'ping') {
-            // Send pong? No, just ignore or log
+            // Keepalive ping - no action needed
           }
-        } catch (error) {
-          console.error('Error parsing WebSocket message:', error);
-          errorCallbackRef.current?.('Failed to parse message from server');
+        } catch (e) {
+          console.log('Non-JSON message:', event.data);
         }
       };
 
@@ -231,36 +253,53 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
     }
   }, []);
 
-  const sendAudioWithImage = useCallback(
-    (audioData: ArrayBuffer, imageData: string) => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        // Convert ArrayBuffer to base64
-        const bytes = new Uint8Array(audioData);
-        let binary = '';
-        for (let i = 0; i < bytes.byteLength; i++) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        const base64Audio = btoa(binary);
+  const sendAudioWithImage = useCallback((audioData: ArrayBuffer, imageData: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      const bytes = new Uint8Array(audioData);
+      let binary = '';
+      for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      const base64Audio = btoa(binary);
 
-        const message = {
+      wsRef.current.send(
+        JSON.stringify({
           audio_segment: base64Audio,
           image: imageData
-        };
+        })
+      );
+    }
+  }, []);
 
-        wsRef.current.send(JSON.stringify(message));
-        console.log(`Sent audio + image: ${audioData.byteLength} bytes audio`);
-      }
-    },
-    []
-  );
+  const sendSignSequence = useCallback((frames: string[]) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'sign_sequence',
+          frames: frames
+        })
+      );
+    }
+  }, []);
 
-  // Callback registration methods
+  const sendConfig = useCallback((config: any) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'config',
+          ...config
+        })
+      );
+      console.log('Sent config to server:', config);
+    }
+  }, []);
+
   const onAudioReceived = useCallback(
     (
       callback: (
-        audioData: string,
-        timingData?: any,
-        sampleRate?: number,
+        data: string,
+        timing?: any,
+        rate?: number,
         method?: string
       ) => void
     ) => {
@@ -277,6 +316,15 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
     errorCallbackRef.current = callback;
   }, []);
 
+  const onAnimationReceived = useCallback((callback: (gesture: string) => void) => {
+    animationReceivedCallbackRef.current = callback;
+  }, []);
+
+  const onCaptionReceived = useCallback((callback: (text: string) => void) => {
+    captionReceivedCallbackRef.current = callback;
+  }, []);
+
+
   const onStatusChange = useCallback(
     (
       callback: (status: 'connected' | 'disconnected' | 'connecting') => void
@@ -286,33 +334,28 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
     []
   );
 
-  const triggerInterrupt = useCallback(() => {
-    // 1. Local interrupt (stop audio)
-    interruptCallbackRef.current?.();
-
-    // 2. Server interrupt
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'interrupt' }));
-    }
-  }, []);
+  const value: WebSocketContextType = {
+    isConnected,
+    isConnecting,
+    connect,
+    disconnect,
+    sendAudioSegment,
+    sendImage,
+    sendAudioWithImage,
+    sendSignSequence,
+    sendConfig,
+    onAudioReceived,
+    onInterrupt,
+    onError,
+    onStatusChange,
+    onAnimationReceived,
+    onCaptionReceived,
+    browserImage,
+    lastMessage
+  };
 
   return (
-    <WebSocketContext.Provider
-      value={{
-        isConnected,
-        isConnecting,
-        connect,
-        disconnect,
-        sendAudioSegment,
-        sendImage,
-        sendAudioWithImage,
-        onAudioReceived,
-        onInterrupt,
-        onError,
-        onStatusChange,
-        triggerInterrupt
-      }}
-    >
+    <WebSocketContext.Provider value={value}>
       {children}
     </WebSocketContext.Provider>
   );

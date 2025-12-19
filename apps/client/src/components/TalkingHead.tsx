@@ -1,7 +1,12 @@
+
 'use client';
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { Loader2, Settings, ChevronDown, ChevronUp, ZoomIn, ZoomOut, User } from 'lucide-react';
+import { SignAnimator, Sign_Default } from '@/lib/SignAnimator';
+import { useBrowserSpeechRecognition } from '@/hooks/useBrowserSpeechRecognition';
+import { DeafAvatar } from '@/components/DeafAvatar';
+import { Loader2, Settings, ChevronDown, ChevronUp, ZoomIn, ZoomOut, User, Ear, EarOff, Hand, Video, Mic, CircleDot, StopCircle } from 'lucide-react';
+import CameraStream from './CameraStream';
 import { Button } from '@/components/ui/button';
 import {
   Card,
@@ -27,22 +32,22 @@ import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { useWebSocketContext } from '@/contexts/WebSocketContext';
+import BrowserView from './BrowserView';
+import VoiceActivityDetector from './VoiceActivityDetector';
 
 interface TalkingHeadProps {
   className?: string;
-  cameraStream?: MediaStream | null;
 }
 
 const TalkingHead: React.FC<TalkingHeadProps> = ({
-  className = '',
-  cameraStream
+  className = ''
 }) => {
-  const avatarRef = useRef<HTMLDivElement>(null);
   const headRef = useRef<any>(null);
+  const avatarRef = useRef<HTMLDivElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const animatorRef = useRef<SignAnimator | null>(null);
   const audioQueueRef = useRef<any[]>([]);
   const isPlayingAudioRef = useRef(false);
-  const lastInterruptRef = useRef<number>(0); // Track last interrupt time for safety buffer
 
   const [isLoading, setIsLoading] = useState(true);
   const [status, setStatus] = useState<{
@@ -59,6 +64,14 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
   const [customUrl, setCustomUrl] = useState('');
   const [cameraView, setCameraView] = useState<'head' | 'full'>('full');
   const [debugLog, setDebugLog] = useState<string[]>([]); // New debug log
+
+  // User Modes
+  const [userMode, setUserMode] = useState<'normal' | 'mute' | 'deaf'>('normal');
+
+  // Twilio Call State
+  const [isCallConnected, setIsCallConnected] = useState(false);
+
+
 
   const addDebug = (msg: string) => setDebugLog(prev => [msg, ...prev].slice(0, 5));
 
@@ -81,14 +94,111 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
   // Get WebSocket context
   const {
     isConnected,
-    isConnecting,
+    isConnecting, // Restored
     connect,
     disconnect,
     onAudioReceived,
     onInterrupt,
     onError,
-    onStatusChange
+    onStatusChange,
+    browserImage, // Restored
+    sendConfig, // Restored
+    onAnimationReceived,
+    onCaptionReceived,
+    sendSignSequence
   } = useWebSocketContext();
+
+  // Client-Side STT for Deaf Mode (Sign-Kit style)
+  const { transcript, startListening, stopListening, resetTranscript } = useBrowserSpeechRecognition();
+  const lastSignedLengthRef = useRef(0);
+
+  // Mute Mode: Sign Language Capture
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const [isRecordingSign, setIsRecordingSign] = useState(false);
+  const signIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const signFramesRef = useRef<string[]>([]);
+  const hiddenVideoRef = useRef<HTMLVideoElement>(null);
+
+  // Sync mode with backend
+  useEffect(() => {
+    if (isConnected) {
+      sendConfig({ mode: userMode });
+      addDebug(`Switched to ${userMode} mode`);
+    }
+  }, [userMode, isConnected, sendConfig]);
+
+  // Model Switcher
+  useEffect(() => {
+    if (!headRef.current) return;
+    loadAvatar(selectedAvatar);
+  }, [userMode]);
+
+
+  // Handle Animation Commands & Captions & Client STT
+  /*
+  // REMOVED: Using generic onCaptionReceived callback instead to avoid race conditions
+  useEffect(() => {
+    // Deaf Mode: Sign Captions (Backend AI)
+    if (userMode === 'deaf' && lastMessage?.type === 'caption' && lastMessage.text) {
+      animatorRef.current?.playText(lastMessage.text);
+    }
+  }, [lastMessage, userMode]);
+  */
+
+  useEffect(() => {
+    // Deaf Mode: Sign User Speech (Client STT)
+    // DISABLED: User wants Avatar to sign AI Response, not Mirror User
+    /*
+    if (userMode === 'deaf') {
+      startListening();
+    } else {
+      stopListening();
+      resetTranscript();
+      lastSignedLengthRef.current = 0;
+    }
+    */
+  }, [userMode]);
+
+  useEffect(() => {
+    // Reactively sign new user speech
+    if (userMode === 'deaf' && transcript && animatorRef.current) {
+      // Get only new part
+      const fullLen = transcript.length;
+      const prevLen = lastSignedLengthRef.current;
+      if (fullLen > prevLen) {
+        const newText = transcript.slice(prevLen).trim();
+        if (newText) {
+          console.log("DeafAvatar: Signing User Input:", newText);
+          animatorRef.current.playText(newText);
+        }
+        lastSignedLengthRef.current = fullLen;
+      }
+    }
+  }, [transcript, userMode]);
+
+  useEffect(() => {
+    // Register Animation Callback
+    onAnimationReceived((gesture) => {
+      const anim = gesture.toLowerCase();
+
+      if (userMode === 'deaf') {
+        // Play the gesture as text (e.g. "HOME" -> Sign Home)
+        animatorRef.current?.playText(gesture);
+      } else {
+        // Standard Avatar Logic
+        if (anim.includes('wave') || anim.includes('hello')) {
+          if (headRef.current) {
+            headRef.current.speak({ text: " ", avatarMood: 'happy' });
+          }
+        } else if (anim.includes('a') || anim.includes('home') || anim.includes('you')) {
+          // Should we handle home/you for standard avatar too?
+          // Standard avatar lacks bones for this via SignAnimator (unless compatible).
+          // We decided fallback might fail or T-pose.
+          showStatus(`Received Sign Command: ${gesture} `, 'info');
+        }
+      }
+    });
+  }, [onAnimationReceived, userMode]);
 
   const showStatus = (message: string, type: 'success' | 'error' | 'info') => {
     setStatus({ message, type });
@@ -97,44 +207,35 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
     }
   };
 
+
+
   // Initialize audio context
   const initAudioContext = useCallback(async () => {
     if (!audioContextRef.current) {
-      // Allow browser to choose default sample rate (usually 44.1k or 48k)
-      // This prevents sync issues with 24k audio
-      audioContextRef.current = new AudioContext();
+      audioContextRef.current = new AudioContext({ sampleRate: 22050 });
     }
     if (audioContextRef.current.state === 'suspended') {
       await audioContextRef.current.resume();
     }
   }, []);
 
-  // Helper to convert base64 to ArrayBuffer
-  function base64ToArrayBuffer(base64: string) {
-    const binaryString = window.atob(base64);
-    const len = binaryString.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
+  // Convert base64 to ArrayBuffer
+  const base64ToArrayBuffer = useCallback((base64: string) => {
+    const binaryString = atob(base64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
       bytes[i] = binaryString.charCodeAt(i);
     }
     return bytes.buffer;
-  }
+  }, []);
 
-  // Helper to play silence and wake up audio engine
-  const playSilence = useCallback(async () => {
-    if (!headRef.current || !audioContextRef.current) return;
-
-    try {
-      // Create a tiny silence buffer (0.1s)
-      const ctx = audioContextRef.current;
-      const buffer = ctx.createBuffer(1, ctx.sampleRate / 10, ctx.sampleRate);
-
-      // Speak silence - this forces the internal audio context to resume/stay active
-      headRef.current.speakAudio({ audio: buffer });
-      console.log(`📢 Waking up audio engine with silence (${ctx.sampleRate}Hz)`);
-    } catch (e) {
-      console.error('Failed to play silence:', e);
+  // Convert Int16Array to Float32Array
+  const int16ArrayToFloat32 = useCallback((int16Array: Int16Array) => {
+    const float32Array = new Float32Array(int16Array.length);
+    for (let i = 0; i < int16Array.length; i++) {
+      float32Array[i] = int16Array[i] / 32768.0;
     }
+    return float32Array;
   }, []);
 
   // Play next audio in queue
@@ -148,38 +249,8 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
     isPlayingAudioRef.current = true;
     setIsSpeaking(true);
 
-    // SAFETY BUFFER: If an interrupt happened recently (< 500ms), wait for it to clear
-    // This prevents the "Stop" command from killing the new "Speak" command
-    const timeSinceInterrupt = Date.now() - lastInterruptRef.current;
-    if (timeSinceInterrupt < 500) {
-      const waitTime = 500 - timeSinceInterrupt;
-      console.log(`⏳ Safety Buffer: Waiting ${waitTime}ms for avatar to reset...`);
-      setTimeout(() => playNextAudio(), waitTime);
-      return;
-    }
-
-    // Ensure AudioContext is initialized and running
-    if (!audioContextRef.current) {
-      // Use interactive latency for snappier audio/interrupts
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      audioContextRef.current = new AudioContextClass({ latencyHint: 'interactive', sampleRate: 48000 });
-    }
-
-    if (audioContextRef.current?.state === 'suspended') {
-      console.log('AudioContext suspended, attempting to resume...');
-      try {
-        await audioContextRef.current.resume();
-        console.log('AudioContext resumed successfully');
-
-        // Also fire silence to wake up library
-        playSilence();
-      } catch (e) {
-        console.error('Failed to resume AudioContext:', e);
-      }
-    }
-
     const audioItem = audioQueueRef.current.shift();
-    console.log('Playing audio item:', audioItem, 'AudioContext State:', audioContextRef.current?.state);
+    console.log('Playing audio item:', audioItem);
 
     try {
       if (
@@ -195,28 +266,14 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
           wdurations: audioItem.timingData.word_durations
         };
 
-        // Check if we actually have valid timing data (sometimes it's empty)
-        if (speakData.words.length > 0) {
-          console.log('Using TalkingHead with timing data:', speakData);
-          headRef.current.speakAudio(speakData);
-        } else {
-          console.warn('Timing data empty. Playing audio directly to speakers (Bypassing Avatar).');
-          // Manual Playback to ensure sound is heard
-          try {
-            const source = audioContextRef.current!.createBufferSource();
-            source.buffer = audioItem.buffer;
-            source.connect(audioContextRef.current!.destination);
-            source.start(audioContextRef.current!.currentTime);
-          } catch (e) {
-            console.error('Manual fallback playback failed:', e);
-          }
-        }
+        console.log('Using TalkingHead with timing data:', speakData);
+        headRef.current.speakAudio(speakData);
 
         // Set timer for next audio
         setTimeout(() => {
           console.log('TalkingHead audio finished, playing next...');
           playNextAudio();
-        }, audioItem.duration * 1000 + 50); // Add small buffer
+        }, audioItem.duration * 1000);
       } else if (headRef.current) {
         // Basic TalkingHead audio without timing
         console.log('Using basic TalkingHead audio');
@@ -225,7 +282,7 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
         setTimeout(() => {
           console.log('Basic TalkingHead audio finished, playing next...');
           playNextAudio();
-        }, audioItem.duration * 1000 + 50);
+        }, audioItem.duration * 1000);
       } else {
         // Fallback to Web Audio API
         console.log('Using Web Audio API fallback');
@@ -244,7 +301,15 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
       // Continue to next audio on error
       setTimeout(() => playNextAudio(), 100);
     }
-  }, [initAudioContext, playSilence]);
+  }, [initAudioContext]);
+
+  const handleCaptionReceived = useCallback((text: string) => {
+    if (userMode === 'deaf' && animatorRef.current) {
+      console.log("Triggering Animator for Caption:", text);
+      showStatus(`Signing: "${text.substring(0, 20)}..."`, 'info');
+      animatorRef.current.playText(text);
+    }
+  }, [userMode]);
 
   // Handle audio from WebSocket
   const handleAudioReceived = useCallback(
@@ -264,16 +329,28 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
       try {
         await initAudioContext();
 
-        // Convert base64 to ArrayBuffer (WAV file bytes)
+        // Convert base64 to audio buffer
         const arrayBuffer = base64ToArrayBuffer(base64Audio);
+        const int16Array = new Int16Array(arrayBuffer);
+        const float32Array = int16ArrayToFloat32(int16Array);
 
-        // Decode WAV using browser's native decoder (Robust & Safe)
-        const audioBuffer = await audioContextRef.current!.decodeAudioData(arrayBuffer);
+        console.log('Audio conversion successful:', {
+          arrayBufferLength: arrayBuffer.byteLength,
+          int16Length: int16Array.length,
+          float32Length: float32Array.length
+        });
 
-        console.log('✅ WAV Audio Decoded:', {
+        // Create AudioBuffer
+        const audioBuffer = audioContextRef.current!.createBuffer(
+          1,
+          float32Array.length,
+          sampleRate
+        );
+        audioBuffer.copyToChannel(float32Array, 0);
+
+        console.log('AudioBuffer created:', {
           duration: audioBuffer.duration,
           sampleRate: audioBuffer.sampleRate,
-          channels: audioBuffer.numberOfChannels,
           length: audioBuffer.length
         });
 
@@ -292,10 +369,10 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
 
         // Start playing if not already playing
         if (!isPlayingAudioRef.current) {
-          console.log('Starting audio playback (Queue not empty, not playing)...');
+          console.log('Starting audio playback...');
           playNextAudio();
         } else {
-          console.log('Audio already playing, added to queue. Current Queue Size:', audioQueueRef.current.length);
+          console.log('Audio already playing, added to queue');
         }
 
         const timingInfo = timingData
@@ -311,7 +388,7 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
         );
       }
     },
-    [initAudioContext, playNextAudio]
+    [initAudioContext, base64ToArrayBuffer, int16ArrayToFloat32, playNextAudio]
   );
 
   // Handle interrupt from server
@@ -320,49 +397,73 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
     audioQueueRef.current = [];
     isPlayingAudioRef.current = false;
     setIsSpeaking(false);
-    lastInterruptRef.current = Date.now(); // Mark interrupt time
 
     // Stop TalkingHead if speaking
-    if (headRef.current) {
-      try {
-        console.log('Stopping TalkingHead animation/audio...');
-        // 🛑 Stop the avatar immediately
-        headRef.current.stop();
+    // if (headRef.current) {
+    //   try {
+    //     headRef.current.stop();
+    //   } catch (error) {
+    //     console.error('Error stopping TalkingHead:', error);
+    //   }
+    // }
 
-        // Note: We previously used audioContext.suspend() here, but it caused 
-        // "Resumed Ghost Audio" (Double Audio) issues when resuming for the next sentence.
-        // We now rely on headRef.current.stop() and low-latency AudioContext.
-
-        // "Wake up" the audio engine with silence immediately after stop
-        setTimeout(() => {
-          playSilence();
-        }, 50);
-      } catch (error) {
-        console.error('Error stopping TalkingHead:', error);
-      }
-    }
-
-    console.log('Audio interrupted, queue cleared, state reset.');
-  }, [playSilence]);
+    console.log('Audio interrupted and cleared');
+  }, []);
 
   // Register WebSocket callbacks
   useEffect(() => {
     onAudioReceived(handleAudioReceived);
     onInterrupt(handleInterrupt);
-    onError((error) => showStatus(`WebSocket error: ${error}`, 'error'));
+    onError((error) => showStatus(`WebSocket error: ${error} `, 'error'));
     onStatusChange((status) => {
       if (status === 'connected')
         showStatus('Connected to voice assistant', 'success');
-      if (status === 'disconnected')
+      else if (status === 'disconnected')
         showStatus('Disconnected from server', 'info');
+      else
+        showStatus(status, 'info');
     });
+
+    // Listen to Twilio Voice Manager
+    import('@/utils/TwilioVoiceManager').then(mod => {
+      const manager = mod.default.getInstance();
+
+      manager.on('connected', () => {
+        console.log("UI: Call Connected");
+        setIsCallConnected(true);
+        showStatus("Phone Call Connected", "success");
+      });
+
+      manager.on('disconnected', () => {
+        console.log("UI: Call Disconnected");
+        setIsCallConnected(false);
+        showStatus("Phone Call Ended", "info");
+      });
+
+      manager.on('error', (err: any) => {
+        showStatus(`Call Error: ${err.message || err} `, "error");
+      });
+    });
+
+    // Register Caption Listener
+    onCaptionReceived((text) => {
+      console.log("TalkingHead: Caption Received:", text);
+      // We check userModeRef if needed, or rely on re-registration?
+      // Let's use logic inside: if userMode is deaf.
+      // But userMode is state.
+      // We need to ensure this callback is fresh.
+      handleCaptionReceived(text);
+    });
+
   }, [
     onAudioReceived,
     onInterrupt,
     onError,
     onStatusChange,
+    onCaptionReceived, // NEW
     handleAudioReceived,
-    handleInterrupt
+    handleInterrupt,
+    handleCaptionReceived // NEW
   ]);
 
   // Listen for TalkingHead library to load
@@ -422,7 +523,7 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
         // connect();
       } catch (error: any) {
         setIsLoading(false);
-        showStatus(`Failed to initialize: ${error.message}`, 'error');
+        showStatus(`Failed to initialize: ${error.message} `, 'error');
       }
     };
 
@@ -443,7 +544,7 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
   useEffect(() => {
     if (headRef.current && headRef.current.setView) {
       try {
-        console.log(`Setting camera view to: ${cameraView}`);
+        console.log(`Setting camera view to: ${cameraView} `);
         headRef.current.setView(cameraView);
       } catch (error) {
         console.warn('Failed to set camera view:', error);
@@ -506,14 +607,36 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
     const tryLoad = async (loadUrl: string, attemptName: string) => {
       try {
         addDebug(`Attempting (${attemptName}): ${loadUrl}`);
-        await headRef.current?.showAvatar({
-          url: loadUrl,
-          avatarMood: selectedMood,
-          lipsyncLang: 'en'
-        });
+
+        try {
+          await headRef.current?.showAvatar({
+            url: loadUrl,
+            avatarMood: selectedMood,
+            lipsyncLang: 'en'
+          });
+        } catch (error: any) {
+          console.warn("Avatar Load Error:", error);
+          throw error;
+        }
+
+        // Initialize SignAnimator with the loaded avatar mesh
+        if (headRef.current) {
+          console.log("[DEBUG] TalkingHead keys:", Object.keys(headRef.current));
+          const mesh = headRef.current.scene || headRef.current.armature || headRef.current.avatar?.scene || headRef.current.obj;
+
+          if (mesh) {
+            console.log("[DEBUG] Found avatar mesh:", mesh);
+            animatorRef.current = new SignAnimator(mesh);
+            showStatus('Sign Language Engine Ready', 'success');
+          } else {
+            console.warn("[DEBUG] Could not find avatar mesh in TalkingHead instance");
+          }
+        }
+
         showStatus(`Avatar loaded (${attemptName})`, 'success');
         addDebug(`Success: ${attemptName}`);
         return true;
+
       } catch (e: any) {
         console.error(`Load failed (${attemptName}):`, e);
         addDebug(`Error (${attemptName}): ${e.message}`);
@@ -560,6 +683,56 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
     }
   };
 
+  const toggleRecording = useCallback(() => {
+    if (isRecordingSign) {
+      // STOP Recording
+      setIsRecordingSign(false);
+      if (signIntervalRef.current) {
+        clearInterval(signIntervalRef.current);
+        signIntervalRef.current = null;
+      }
+
+      // Send Sequence
+      if (signFramesRef.current.length > 0) {
+        console.log(`Sending Sign Sequence: ${signFramesRef.current.length} frames`);
+        sendSignSequence(signFramesRef.current);
+        // Backend handles response
+      }
+    } else {
+      // START Recording
+      if (!cameraStream) {
+        alert("No camera stream detected. Please enable camera.");
+        return;
+      }
+
+      // Setup hidden video to play stream for capturing
+      if (hiddenVideoRef.current && hiddenVideoRef.current.srcObject !== cameraStream) {
+        hiddenVideoRef.current.srcObject = cameraStream;
+        hiddenVideoRef.current.play();
+      }
+
+      signFramesRef.current = [];
+      setIsRecordingSign(true);
+
+      // Capture Loop
+      signIntervalRef.current = setInterval(() => {
+        if (hiddenVideoRef.current) {
+          const canvas = document.createElement('canvas');
+          canvas.width = 320; // Lower res for speed
+          canvas.height = 240;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(hiddenVideoRef.current, 0, 0, canvas.width, canvas.height);
+            // Get base64 (remove prefix)
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+            const base64 = dataUrl.split(',')[1];
+            signFramesRef.current.push(base64);
+          }
+        }
+      }, 200); // 5 FPS
+    }
+  }, [isRecordingSign, cameraStream, sendSignSequence]);
+
   return (
     <Card className={`w-full ${className}`}>
       <CardHeader className="text-center">
@@ -568,53 +741,159 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
       </CardHeader>
 
       <CardContent className="space-y-6">
-        {/* Avatar Display */}
-        <div
-          className="relative overflow-hidden rounded-lg bg-gradient-to-br from-gray-100 to-gray-200"
-          style={{ height: '500px' }}
-        >
-          <div ref={avatarRef} className="h-full w-full" />
 
-          {/* Loading Overlay */}
-          {(isLoading || !scriptsLoaded) && (
-            <div className="bg-opacity-90 absolute inset-0 flex items-center justify-center bg-white">
-              <div className="text-center">
-                <Loader2 className="text-primary mx-auto mb-4 h-12 w-12 animate-spin" />
-                <p className="text-muted-foreground">
-                  {!scriptsLoaded
-                    ? 'Loading TalkingHead...'
-                    : 'Loading avatar...'}
-                </p>
+
+        {/* Mute Mode UI: PIP Camera & Control Bar */}
+        {userMode === 'mute' && (
+          <>
+            {/* PIP Camera (Self View) */}
+            <CameraStream
+              onStreamChange={setCameraStream}
+              onClose={() => setUserMode('normal')}
+            />
+
+            {/* Frozen / Recording Indicator Border on Camera? CameraStream handles "Live" indicator. */}
+
+            {/* Bottom Control Bar */}
+            <div className="fixed bottom-6 left-1/2 transform -translate-x-1/2 z-50 flex flex-col items-center gap-2 animate-in slide-in-from-bottom-10 fade-in duration-300">
+              {/* Recording Feedback Bubble */}
+              {isRecordingSign && (
+                <div className="bg-red-600 text-white px-4 py-1 rounded-full text-xs font-bold animate-pulse shadow-lg mb-2">
+                  Recording Signs...
+                </div>
+              )}
+
+              <div className="bg-white/90 dark:bg-slate-900/90 backdrop-blur-md border border-slate-200 dark:border-slate-700 p-2 rounded-2xl shadow-2xl flex items-center gap-4">
+
+                {/* Exit Button */}
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="rounded-full hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500"
+                  onClick={() => setUserMode('normal')}
+                  title="Exit Mute Mode"
+                >
+                  <StopCircle size={20} />
+                </Button>
+
+                {/* Record Button */}
+                <Button
+                  onClick={toggleRecording}
+                  size="lg"
+                  className={`rounded-full w-16 h-16 shadow-xl border-4 transition-all duration-300 ${isRecordingSign
+                    ? 'bg-white border-red-500 hover:bg-red-50 text-red-600 scale-105'
+                    : 'bg-red-600 border-red-100 hover:bg-red-700 hover:scale-105 hover:shadow-red-500/25 ring-2 ring-red-100 ring-offset-2'
+                    }`}
+                >
+                  {isRecordingSign
+                    ? <div className="w-6 h-6 bg-red-600 rounded-sm" />
+                    : <div className="w-6 h-6 bg-white rounded-full" />
+                  }
+                </Button>
+
+                {/* Info / Help */}
+                <div className="w-10 flex justify-center">
+                  <div className="text-[10px] sm:text-xs font-medium text-slate-500 dark:text-slate-400 text-center leading-tight">
+                    {isRecordingSign ? "Tap to\nSend" : "Hold/Tap\nto Sign"}
+                  </div>
+                </div>
+
               </div>
             </div>
-          )}
+          </>
+        )}
 
-          {/* Status Badges */}
-          {scriptsLoaded && !isLoading && (
-            <div className="absolute top-4 left-4 space-y-2">
-              <Badge variant={isConnected ? 'default' : 'secondary'}>
-                {isConnecting
-                  ? 'Connecting...'
-                  : isConnected
-                    ? 'Connected'
-                    : 'Disconnected'}
-              </Badge>
-              {isSpeaking && (
-                <Badge variant="destructive" className="block">
-                  Speaking...
+        {/* Hidden Video for Capture */}
+        <video ref={hiddenVideoRef} className="hidden" muted playsInline autoPlay />
+
+        {/* Main Display Area - Grid Layout if browsing, else Single Column */}
+        <div className={`grid gap-4 h-[500px] transition-all duration-300 ${browserImage ? 'grid-cols-1 lg:grid-cols-2' : 'grid-cols-1'}`}>
+
+          {/* LEFT: Avatar Display (Full width if not browsing) */}
+          <div className="relative overflow-hidden rounded-lg bg-gradient-to-br from-gray-100 to-gray-200 h-full border-2 border-slate-200 dark:border-slate-800 shadow-sm">
+            <div className="absolute inset-0 flex items-center justify-center">
+              <div ref={avatarRef} className={`h-full w-full ${userMode === 'deaf' ? 'invisible' : ''}`} />
+            </div>
+
+            {/* Deaf Avatar Overlay */}
+            {userMode === 'deaf' && (
+              <div className="absolute inset-0 z-20">
+                <DeafAvatar onAnimatorReady={(anim) => {
+                  console.log("Switched to YBot Animator");
+                  animatorRef.current = anim;
+                }} />
+              </div>
+            )}
+
+            {/* Loading Overlay */}
+            {(isLoading || !scriptsLoaded) && (
+              <div className="bg-opacity-90 absolute inset-0 flex items-center justify-center bg-white z-20">
+                <div className="text-center">
+                  <Loader2 className="text-primary mx-auto mb-4 h-12 w-12 animate-spin" />
+                  <p className="text-muted-foreground">
+                    {!scriptsLoaded
+                      ? 'Loading TalkingHead...'
+                      : 'Loading avatar...'}
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Status Badges */}
+            {scriptsLoaded && !isLoading && (
+              <div className="absolute top-4 left-4 space-y-2 z-10">
+                <Badge variant={isConnected ? 'default' : 'secondary'}>
+                  {isConnecting
+                    ? 'Connecting...'
+                    : isConnected
+                      ? 'Connected'
+                      : 'Disconnected'}
                 </Badge>
-              )}
+                {isSpeaking && (
+                  <Badge variant="destructive" className="block">
+                    Speaking...
+                  </Badge>
+                )}
+                {isRecordingSign && (
+                  <Badge className="block bg-red-600 animate-pulse">
+                    🎥 Recording...
+                  </Badge>
+                )}
+              </div>
+            )}
+
+            {/* Controls Overlay */}
+            <div className="absolute bottom-4 left-0 right-0 px-4 flex justify-between z-10 w-full">
+              <div className="flex gap-2">
+                <Button variant="ghost" size="icon" onClick={() => setIsSettingsOpen(!isSettingsOpen)}>
+                  <Settings className="w-5 h-5" />
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          {/* RIGHT: Browser View (Only visible if browserImage exists) */}
+          {browserImage && (
+            <div className="h-full rounded-lg overflow-hidden border-2 border-slate-200 dark:border-slate-800 shadow-sm bg-slate-50 dark:bg-slate-900 transition-all duration-300 animate-in fade-in slide-in-from-right-10">
+              <BrowserView image={browserImage} />
             </div>
           )}
         </div>
 
+        {/* VAD Visualization */}
+        <div className="mt-4">
+          <VoiceActivityDetector
+            cameraStream={cameraStream}
+            autoStart={userMode !== 'mute'}
+          />
+        </div>
+
         {/* Connection Control */}
-        <div className="flex gap-3">
+        <div className="flex justify-center space-x-4">
           <Button
-            onClick={isConnected ? disconnect : () => connect()}
-            disabled={isConnecting || !scriptsLoaded}
-            className="flex-1"
             variant={isConnected ? 'destructive' : 'default'}
+            onClick={() => (isConnected ? disconnect() : connect())}
+            className="w-40 transition-all duration-300 transform hover:scale-105"
           >
             {isConnecting
               ? 'Connecting...'
@@ -634,6 +913,50 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
             {cameraView === 'full' ? <ZoomIn size={20} /> : <ZoomOut size={20} />}
           </Button>
         </div>
+
+        {/* Mode Toggles for Mute/Deaf Accessibility */}
+        <div className="flex gap-2 justify-center py-2 px-1">
+          <Button
+            variant={userMode === 'mute' ? "default" : "outline"}
+            onClick={() => setUserMode(m => m === 'mute' ? 'normal' : 'mute')}
+            className={`flex-1 h-8 text-xs ${userMode === 'mute' ? 'bg-blue-600 hover:bg-blue-700' : ''}`}
+            title="Mute Mode: Use Sign Language Input"
+          >
+            <Hand className="mr-1 h-3 w-3" />
+            Mute Users
+          </Button>
+
+          <Button
+            variant={userMode === 'deaf' ? "default" : "outline"}
+            onClick={() => setUserMode(m => m === 'deaf' ? 'normal' : 'deaf')}
+            className={`flex-1 h-8 text-xs ${userMode === 'deaf' ? 'bg-purple-600 hover:bg-purple-700' : ''}`}
+            title="Deaf Mode: Avatar signs back"
+          >
+            {userMode === 'deaf' ? <EarOff className="mr-1 h-3 w-3" /> : <Ear className="mr-1 h-3 w-3" />}
+            Deaf Users
+          </Button>
+        </div>
+
+        {userMode === 'deaf' && (
+          <div className="text-center text-[10px] text-purple-600 font-bold animate-pulse">
+            Avatar will respond with Sign Language videos
+          </div>
+        )}
+
+        {/* Twilio Call Controls */}
+        {isCallConnected && (
+          <div className="flex gap-3 justify-center">
+            <Button
+              variant="destructive"
+              className="w-full bg-red-600 hover:bg-red-700 animate-pulse"
+              onClick={() => {
+                import('@/utils/TwilioVoiceManager').then(m => m.default.getInstance().disconnect());
+              }}
+            >
+              <span className="mr-2">📞</span> End Call
+            </Button>
+          </div>
+        )}
 
         {/* Settings */}
         <Collapsible open={isSettingsOpen} onOpenChange={setIsSettingsOpen}>
@@ -711,16 +1034,6 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
           <Alert variant={status.type === 'error' ? 'destructive' : 'default'}>
             <AlertDescription>{status.message}</AlertDescription>
           </Alert>
-        )}
-
-        {/* Debug Log (Visible only if there are logs) */}
-        {debugLog.length > 0 && (
-          <div className="mt-4 p-2 bg-black/5 rounded text-[10px] font-mono text-gray-600 overflow-hidden">
-            <p className="font-bold mb-1">Debug Log:</p>
-            {debugLog.map((log, i) => (
-              <div key={i} className="truncate">{log}</div>
-            ))}
-          </div>
         )}
       </CardContent>
     </Card>

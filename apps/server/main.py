@@ -42,7 +42,10 @@ load_dotenv()  # Load from .env file
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("server_debug.log")
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -402,7 +405,11 @@ class GeminiProcessor:
             SIGN LANGUAGE CAPABILITIES:
             - If you need to perform a sign language gesture (e.g. for deaf users), use the BROWSE command to show it.
             - Format: [BROWSE: https://www.signasl.org/sign/word] (Replace 'word' with the specific sign).
-            - Example: "I can show you how to sign hello. [BROWSE: https://www.signasl.org/sign/hello]"
+            - Example: "I can show you how to sign hello. [BROWSE: https://www.signasl.org/sign/hello]"            AVATAR ANIMATIONS:
+            - For greetings (Hello, Hi), ALSO use [ANIMATE: wave] to make the avatar wave.
+            - For the words "Home" or "You", use [ANIMATE: home] or [ANIMATE: you] instead of BROWSE.
+            - Example: "This is home. [ANIMATE: home]"
+            - Example: "Hello! [ANIMATE: wave]"
             """
             
             self.sessions[user_id] = self.model.start_chat(
@@ -1420,9 +1427,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 mode = client_config.get("mode", "normal")
                 
                 if mode == "deaf":
-                    transcribed_text += " [SYSTEM INSTRUCTION: The user is DEAF. You MUST respond with a [BROWSE: url] command pointing to a sign language video (e.g. from signasl.org) that represents your response. Do not rely on audio output alone.]"
+                    transcribed_text += " [SYSTEM INSTRUCTION: The user is DEAF. Respond with short, simple sentences suitable for sign language interpretation. Do not generate [BROWSE] commands unless explicitly asked.]"
                 elif mode == "mute":
                      transcribed_text += " [SYSTEM NOTE: User is Mute.]"
+                
+                logger.info(f"📝 Final Prompt to Gemini: {transcribed_text}")
 
                 # Check if transcription indicates noise
                 if transcribed_text in ["NOISE_DETECTED", "NO_SPEECH", None]:
@@ -1525,6 +1534,25 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             except Exception as e:
                                 logger.error(f"Error handling SMS command: {e}")
                         
+                        elif "[ANIMATE:" in sentence:
+                            try:
+                                logger.info(f"💃 Detected ANIMATE command: {sentence}")
+                                match = re.search(r'\[ANIMATE:\s*(.+?)\]', sentence)
+                                if match:
+                                    gesture = match.group(1).strip().lower()
+                                    logger.info(f"Triggering animation: {gesture}")
+                                    
+                                    # Send animate command to frontend
+                                    await websocket.send_text(json.dumps({
+                                        "type": "animate",
+                                        "gesture": gesture
+                                    }))
+                                    
+                                    # Remove command from spoken text so avatar doesn't read it
+                                    sentence = sentence.replace(match.group(0), "").strip()
+                            except Exception as e:
+                                logger.error(f"Error handling ANIMATE command: {e}")
+
                         elif "[BROWSE:" in sentence:
                             try:
                                 logger.info(f"🌐 Detected BROWSE command: {sentence}")
@@ -1565,6 +1593,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                         # To make it agentic, we might need to trigger a self-loop? 
                                         # Let's keep it simple: User initiates, Agent acts, User verifies.
                                         pass
+                                    
+                                    # Remove command from spoken text
+                                    sentence = sentence.replace(match.group(0), "").strip()
                             except Exception as e:
                                 logger.error(f"Error handling BROWSE command: {e}")
 
@@ -1613,6 +1644,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 logger.error(f"Error handling ACTION command: {e}")
                         
                         logger.info(f"🎵 Synthesizing sentence {sentence_count}: '{sentence}'")
+
+                        # Send Caption for Deaf Mode / UI
+                        await websocket.send_text(json.dumps({
+                            "type": "caption",
+                            "text": sentence
+                        }))
                         
                         # Generate TTS for this sentence WITH NATIVE TIMING
                         tts_task = asyncio.create_task(
@@ -1681,6 +1718,20 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # Handle config update
                         if message.get("type") == "config":
                             manager.set_config(client_id, message)
+                            
+                            # Trigger greeting if switching to Deaf mode
+                            if message.get("mode") == "deaf":
+                                logger.info(f"🤟 User {client_id} switched to Deaf Mode - Triggering greeting")
+                                
+                                # Trigger Wave Animation immediately
+                                await websocket.send_json({"type": "animate", "gesture": "wave"})
+                                
+                                # Generate text greeting
+                                processing_task = asyncio.create_task(
+                                    process_audio_segment(audio_data=None, image_data=None, text_input="System Notification: User enabled Deaf Mode. Say hello.")
+                                )
+                                manager.set_task(client_id, "processing", processing_task)
+                            
                             continue
 
                         # Handle complete audio segments from frontend
@@ -1724,7 +1775,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     except:
                                         pass
                                 
-                                prompt = "Interpret this sign language video sequence. Translate the signs into English text. If it is a request, fulfill it. If it is a greeting, reply naturally."
+                                prompt = "The user is communicating via Sign Language (video frames attached). 1. Identify the signs. 2. Respond directly to their meaning. DO NOT describe the signs. DO NOT say 'The user signed...'. interact naturally as if they spoke to you."
                                 processing_task = asyncio.create_task(
                                     process_audio_segment(audio_data=None, image_data=decoded_frames, text_input=prompt)
                                 )
